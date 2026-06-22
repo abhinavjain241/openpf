@@ -20,10 +20,21 @@ from sqlalchemy.orm import Session
 from app.core.config import get_settings
 from app.models.entities import ScheduledTask, ScheduledTaskLog
 from app.services.claude_sdk_config import (
-    build_security_hooks, build_subagents, configure_sdk_auth,
-    parse_setting_sources, project_root, resolve_sdk_cwd, resolve_t212_env,
-    _T212_MCP_TOOLS, _MARKET_MCP_TOOLS, _SCHEDULER_MCP_TOOLS,
-    _FUNDAMENTALS_MCP_TOOLS, _INTEL_MCP_TOOLS, _WATCHLIST_MCP_TOOLS,
+    build_security_hooks,
+    build_subagents,
+    configure_sdk_auth,
+    parse_setting_sources,
+    project_root,
+    resolve_gs_research_env,
+    resolve_sdk_cwd,
+    resolve_t212_env,
+    _T212_MCP_TOOLS,
+    _MARKET_MCP_TOOLS,
+    _SCHEDULER_MCP_TOOLS,
+    _FUNDAMENTALS_MCP_TOOLS,
+    _INTEL_MCP_TOOLS,
+    _WATCHLIST_MCP_TOOLS,
+    _GS_RESEARCH_MCP_TOOLS,
 )
 from app.services import costs_service
 from app.services.config_store import ConfigStore
@@ -82,7 +93,11 @@ def _detect_block(output: str, parsed: dict[str, Any] | None) -> str | None:
     if isinstance(parsed, dict):
         status = str(parsed.get("status") or "").strip().lower()
         if status.startswith("blocked"):
-            return str(parsed.get("blocker") or parsed.get("reason") or "agent reported a blocked status")
+            return str(
+                parsed.get("blocker")
+                or parsed.get("reason")
+                or "agent reported a blocked status"
+            )
     low = (output or "").lower()
     for marker in _BLOCK_MARKERS:
         if marker in low:
@@ -151,7 +166,9 @@ def _persist_goal_proposals(
     # would wipe live proposals without putting anything back.
     pending: list[TradeIntent] = []
     for prop in proposals:
-        instrument_code = str(prop.get("instrument") or prop.get("instrument_code") or "").strip()
+        instrument_code = str(
+            prop.get("instrument") or prop.get("instrument_code") or ""
+        ).strip()
         if not instrument_code:
             continue
         underlying = str(prop.get("underlying") or "").strip().upper()
@@ -165,11 +182,18 @@ def _persist_goal_proposals(
         notional = max(0.0, _coerce_float(prop.get("notional_gbp")) or 0.0)
         entry_gbx = _coerce_float(prop.get("entry_price_gbx"))
         quantity = _coerce_float(prop.get("approx_shares"))
-        if (quantity is None or quantity <= 0) and entry_gbx and entry_gbx > 0 and notional > 0:
+        if (
+            (quantity is None or quantity <= 0)
+            and entry_gbx
+            and entry_gbx > 0
+            and notional > 0
+        ):
             # GBX → GBP for the per-share price when deriving share count.
             quantity = notional / (entry_gbx / 100.0)
         if not quantity or quantity <= 0:
-            logger.warning("alpha-loop proposal skipped (no usable quantity): %s", instrument_code)
+            logger.warning(
+                "alpha-loop proposal skipped (no usable quantity): %s", instrument_code
+            )
             continue
 
         rationale = str(prop.get("rationale") or "").strip()
@@ -209,13 +233,19 @@ def _persist_goal_proposals(
     if not pending:
         return {"created": 0}
 
-    regime = str((parsed or {}).get("regime") or (parsed or {}).get("market_regime") or "neutral")
+    regime = str(
+        (parsed or {}).get("regime") or (parsed or {}).get("market_regime") or "neutral"
+    )
     run = AgentRun(
         status="completed",
         summary_markdown=f"Alpha loop `{task.name}` proposed {len(pending)} leveraged entr"
         f"{'y' if len(pending) == 1 else 'ies'}.",
         market_regime=regime,
-        meta={"source": "alpha_loop", "task_name": task.name, "proposal_count": len(pending)},
+        meta={
+            "source": "alpha_loop",
+            "task_name": task.name,
+            "proposal_count": len(pending),
+        },
     )
     db.add(run)
     db.commit()
@@ -231,6 +261,146 @@ def _persist_goal_proposals(
     db.commit()
     return {"created": len(pending), "run_id": run.id}
 
+
+def _persist_fusion_proposals(
+    db: Session, task: ScheduledTask, parsed: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Turn the GS-fusion task's ``{"proposals": [...]}`` JSON into proposed
+    ``TradeIntent`` rows for the Execution queue.
+
+    Unlike the leveraged alpha-loop proposals, these are ordinary ISA equity/ETF
+    ideas fused from the GS brief. COMPLIANCE GUARD (defence in depth): any proposal
+    that is flagged ``preclearance_required`` is SKIPPED — a preclearance-gated idea
+    must never land as a ready-to-approve order; it stays in the brief text only.
+    A proposal also needs a resolved T212 ``instrument_code`` and a usable quantity.
+    """
+    from app.models.entities import AgentRun, TradeIntent
+    from app.services import gs_research_service as gs
+    from app.services.execution_service import supersede_open_proposals
+
+    proposals = parsed.get("proposals") if isinstance(parsed, dict) else None
+    if not isinstance(proposals, list):
+        return {"created": 0}
+    proposals = [p for p in proposals if isinstance(p, dict)]
+    if not proposals:
+        return {"created": 0}
+
+    broker_mode = str(ConfigStore(db).get_broker().get("broker_mode", "paper")).lower()
+
+    pending: list[TradeIntent] = []
+    skipped_preclearance = 0
+    for prop in proposals:
+        # Hard compliance gate — never queue a preclearance-required idea.
+        if bool(prop.get("preclearance_required")):
+            skipped_preclearance += 1
+            continue
+
+        instrument_code = str(
+            prop.get("instrument_code") or prop.get("instrument") or ""
+        ).strip()
+        symbol = str(prop.get("symbol") or "").strip().upper()
+        if not symbol and instrument_code:
+            symbol = instrument_code.rsplit("_", 1)[0].upper()
+        if not instrument_code or not symbol:
+            logger.warning(
+                "gs-fusion proposal skipped (missing instrument_code/symbol): %s", prop
+            )
+            continue
+
+        # Defence in depth: trust the authoritative per-instrument universe over the
+        # model's own preclearance_required flag. Only queue names the ISA universe
+        # explicitly clears as "no"-preclearance; gate review/yes/unknown verdicts.
+        cleared_verdict = "no" if not bool(prop.get("preclearance_required")) else None
+        verdict_info = gs.check_preclearance([instrument_code, symbol])
+        if verdict_info.get("available"):
+            results = verdict_info.get("results", {})
+            hit = results.get(instrument_code) or results.get(symbol) or {}
+            cleared_verdict = hit.get("verdict")
+            if hit.get("preclearance_required", True):
+                logger.info(
+                    "gs-fusion proposal gated by ISA universe (%s verdict=%s): %s",
+                    symbol,
+                    cleared_verdict,
+                    hit.get("matched_ticker"),
+                )
+                skipped_preclearance += 1
+                continue
+
+        action = str(prop.get("action") or "buy").strip().lower()
+        side = "sell" if action.startswith("sell") else "buy"
+
+        notional = max(0.0, _coerce_float(prop.get("notional_gbp")) or 0.0)
+        quantity = _coerce_float(prop.get("approx_shares"))
+        if (quantity is None or quantity <= 0) and notional > 0:
+            price = _coerce_float(prop.get("entry_price_gbp"))
+            if price and price > 0:
+                quantity = notional / price
+        if not quantity or quantity <= 0:
+            logger.warning(
+                "gs-fusion proposal skipped (no usable quantity): %s", symbol
+            )
+            continue
+
+        rationale = str(prop.get("rationale") or "").strip()
+        source = str(prop.get("source") or "").strip()
+        if source:
+            rationale = f"{rationale}\n\nSource: {source}".strip()
+
+        pending.append(
+            TradeIntent(
+                status="proposed",
+                broker_mode=broker_mode,
+                symbol=symbol[:32],
+                instrument_code=instrument_code[:64],
+                side=side,
+                order_type="market",
+                quantity=quantity,
+                estimated_notional=notional,
+                confidence=_coerce_float(prop.get("confidence")) or 0.55,
+                rationale=rationale,
+                meta={
+                    "source": "gs_fusion",
+                    "task_name": task.name,
+                    "preclearance_required": False,
+                    "preclearance_verdict": cleared_verdict,
+                    "leveraged": False,
+                    "gs_source": source or None,
+                    "risk_flags": prop.get("risk_flags") or [],
+                    "proposal": prop,
+                },
+            )
+        )
+
+    if not pending:
+        return {"created": 0, "skipped_preclearance": skipped_preclearance}
+
+    run = AgentRun(
+        status="completed",
+        summary_markdown=f"GS fusion `{task.name}` proposed {len(pending)} ISA idea"
+        f"{'' if len(pending) == 1 else 's'} from today's Goldman Sachs brief.",
+        market_regime=str((parsed or {}).get("regime") or "neutral"),
+        meta={
+            "source": "gs_fusion",
+            "task_name": task.name,
+            "proposal_count": len(pending),
+        },
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    supersede_open_proposals(db)
+    for intent in pending:
+        intent.run_id = run.id
+        db.add(intent)
+    db.commit()
+    return {
+        "created": len(pending),
+        "run_id": run.id,
+        "skipped_preclearance": skipped_preclearance,
+    }
+
+
 _DEFAULT_TASKS: list[dict[str, Any]] = [
     {
         "name": "morning_brief",
@@ -243,7 +413,7 @@ _DEFAULT_TASKS: list[dict[str, Any]] = [
             "description": "Curated pre-open brief — what matters today across your holdings + macro",
         },
         "prompt": (
-            "Produce Josh's pre-open MARKET BRIEF as a tight markdown artifact. The goal: he has no time to "
+            "Produce Abhinav's pre-open MARKET BRIEF as a tight markdown artifact. The goal: he has no time to "
             "follow news, so YOU read everything and surface only what matters. Steps:\n\n"
             "1. Pull current holdings via the T212 tools; focus on the top ~8 by value (both Invest + ISA).\n"
             "2. For those names, call `get_company_news` (since_days=1) and `get_earnings` — note any earnings "
@@ -259,6 +429,58 @@ _DEFAULT_TASKS: list[dict[str, Any]] = [
             "RULES: portfolio-relevant only. Ignore aggregator/SEO filler (e.g. 'most active stocks today', "
             "generic listicles). If nothing is material, say so in one line — do NOT manufacture noise. No raw "
             "headline dumps. Keep it a genuine 2-minute read."
+        ),
+    },
+    {
+        "name": "gs_fusion_brief",
+        # 08:50 London — after the gs-summarize 'london_open' run (08:30) has
+        # landed today's Goldman Sachs Marquee brief.
+        "cron_expr": "50 8 * * 1-5",
+        "timezone": "Europe/London",
+        "model": settings.claude_model,  # Sonnet — fuses research + book, no execution
+        "enabled": True,
+        "meta": {
+            "task_kind": "gs_fusion",
+            "description": "Fuse the daily Goldman Sachs Marquee brief with the live ISA book + compliance",
+        },
+        "prompt": (
+            "Produce Abhinav's GS FUSION BRIEF: merge today's Goldman Sachs Marquee desk research with his "
+            "live portfolio and his OWN preclearance compliance rules. He wants ONE holistic read, not two "
+            "disconnected feeds. Steps:\n\n"
+            "1. Call `get_gs_research_status` (confirm a fresh brief — note stale_days; if the latest brief is "
+            "more than 2 days old, say so up top). Then `get_latest_gs_brief` and `get_gs_trade_ideas` for "
+            "today's desk views, trade ideas, and risk flags.\n"
+            "2. Call `get_compliance_rules` — these are Abhinav's preclearance constraints. Broad ETFs / index "
+            "products with 50+ constituents, commodities, crypto, FX, and treasury ETFs are FREE to trade; "
+            "single stocks and narrow (<50-constituent) sector ETFs REQUIRE preclearance; no GS-related names. "
+            "For any specific name you intend to surface or propose, call `check_preclearance` (the authoritative "
+            "per-instrument verdict from the ISA universe) — only a `no` verdict is free to trade; `review`/`yes`/"
+            "unknown all require preclearance.\n"
+            "3. Pull live holdings via the T212 tools (ISA). For held names and any GS-flagged tickers, get "
+            "live prices/technicals via marketdata MCP. Note: this is an ISA — there is NO Invest account and "
+            "NO short selling; downside is only via ISA inverse ETPs.\n"
+            "4. FUSE. Produce a tight markdown artifact:\n"
+            "   - **Market narrative** (2-3 lines from the GS brief, dated).\n"
+            "   - **What it means for your book** — for each relevant GS view, map it to a HELD position: "
+            "does it support or threaten the holding? Be specific with the name and the risk.\n"
+            "   - **Actionable ideas** — rank the best GS ideas that are ISA-eligible. For EACH, tag "
+            "**Preclearance: Yes/No** per the rules, and PRIORITISE no-preclearance instruments (broad ETFs/"
+            "index products). For single stocks, surface them as ideas but mark them preclearance-required and "
+            "do NOT propose them as ready orders.\n"
+            "   - **Risk alerts** on current positions raised by today's research.\n\n"
+            "5. Then emit a fenced ```json block (after the markdown) with this exact shape:\n"
+            "   {\n"
+            '     "telegram_summary": "<=3500 chars, the punchy highlights for a phone notification",\n'
+            '     "proposals": [ {"instrument_code": "<T212 instrument code, resolve via search_instruments>", '
+            '"symbol": "INDA", "action": "buy", "notional_gbp": 200, "approx_shares": 3, '
+            '"preclearance_required": false, "confidence": 0.6, "rationale": "...", '
+            '"source": "GS <article> <date>", "risk_flags": []} ]\n'
+            "   }\n"
+            "   ONLY include a proposal when (a) it is ISA-eligible, (b) check_preclearance returns a `no` verdict "
+            "(set preclearance_required false), and "
+            "(c) you resolved a real T212 instrument_code via `search_instruments`. Leave `proposals` an empty "
+            "list if nothing clears that bar — never manufacture a trade. These are PROPOSALS for Abhinav to "
+            "approve; nothing executes automatically. Keep the whole thing a genuine 2-minute read."
         ),
     },
     {
@@ -290,7 +512,7 @@ _DEFAULT_TASKS: list[dict[str, Any]] = [
             "description": "Daily reasoned review of the watchlist → flags worth-noticing items into Attention",
         },
         "prompt": (
-            "Review Josh's WATCHLIST and resurface anything worth noticing — the watchlist must never "
+            "Review Abhinav's WATCHLIST and resurface anything worth noticing — the watchlist must never "
             "become a graveyard. Steps:\n\n"
             "1. Call `list_watchlist` (status=watching). For EACH item, the `note` is the *reason* it's "
             "being watched — that note is your watch condition.\n"
@@ -419,7 +641,12 @@ _DEFAULT_TASKS: list[dict[str, Any]] = [
             "meta": {
                 "task_kind": "claude_with_goal",
                 "description": desc,
-                "goal": {"target_gbp": 50.0, "loss_limit_gbp": 75.0, "max_trades": 4, "window": "day"},
+                "goal": {
+                    "target_gbp": 50.0,
+                    "loss_limit_gbp": 75.0,
+                    "max_trades": 4,
+                    "window": "day",
+                },
             },
             "prompt": (
                 f"{label} agentic alpha pass. Pursue today's profit target within the GOAL CONTEXT, "
@@ -432,13 +659,28 @@ _DEFAULT_TASKS: list[dict[str, Any]] = [
                 "3. Rank the best 1-2 entries with hypothesis, forecast cone, sizing within rails, and invalidation.\n"
                 "4. PROPOSE them as intents for approval — DO NOT execute unless auto-execute is enabled and rails "
                 "permit. Size cautiously into any imminent macro event.\n"
-                "Output a concise markdown report ending with a JSON block {\"proposals\": [...]}."
+                'Output a concise markdown report ending with a JSON block {"proposals": [...]}.'
             ),
         }
         for name, cron, label, desc in (
-            ("alpha_loop_open", "45 7 * * 1-5", "Market-open", "Alpha loop — open: regime-gated scan + propose toward £/day target"),
-            ("alpha_loop_midday", "30 12 * * 1-5", "Midday", "Alpha loop — midday re-scan + propose"),
-            ("alpha_loop_eod", "15 15 * * 1-5", "End-of-day", "Alpha loop — EOD pass + manage open positions"),
+            (
+                "alpha_loop_open",
+                "45 7 * * 1-5",
+                "Market-open",
+                "Alpha loop — open: regime-gated scan + propose toward £/day target",
+            ),
+            (
+                "alpha_loop_midday",
+                "30 12 * * 1-5",
+                "Midday",
+                "Alpha loop — midday re-scan + propose",
+            ),
+            (
+                "alpha_loop_eod",
+                "15 15 * * 1-5",
+                "End-of-day",
+                "Alpha loop — EOD pass + manage open positions",
+            ),
         )
     ],
 ]
@@ -454,17 +696,23 @@ def _aware_utc(value: datetime) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _next_run_utc(cron_expr: str, tz_name: str, now_utc: datetime | None = None) -> datetime:
+def _next_run_utc(
+    cron_expr: str, tz_name: str, now_utc: datetime | None = None
+) -> datetime:
     now = _aware_utc(now_utc or _utcnow())
     tz = ZoneInfo(tz_name)
     trigger = CronTrigger.from_crontab(cron_expr, timezone=tz)
-    next_local = trigger.get_next_fire_time(previous_fire_time=None, now=now.astimezone(tz))
+    next_local = trigger.get_next_fire_time(
+        previous_fire_time=None, now=now.astimezone(tz)
+    )
     if next_local is None:
         raise RuntimeError(f"invalid next run for cron '{cron_expr}'")
     return next_local.astimezone(timezone.utc).replace(tzinfo=None)
 
 
-def fires_in_window(cron_expr: str, tz_name: str, start: datetime, end: datetime) -> list[datetime]:
+def fires_in_window(
+    cron_expr: str, tz_name: str, start: datetime, end: datetime
+) -> list[datetime]:
     """All fire times of ``cron_expr`` in the half-open window ``(start, end]``.
 
     Start-exclusive, end-inclusive, evaluated in ``tz_name``. ``start``/``end``
@@ -488,7 +736,9 @@ def fires_in_window(cron_expr: str, tz_name: str, start: datetime, end: datetime
     return fires
 
 
-def build_today_timeline(db: Session, tz_name: str = "Europe/London", now_utc: datetime | None = None) -> dict[str, Any]:
+def build_today_timeline(
+    db: Session, tz_name: str = "Europe/London", now_utc: datetime | None = None
+) -> dict[str, Any]:
     """Aggregate today's scheduler activity for the 'Today' timeline view.
 
     ``past`` — task logs created today (in ``tz_name``), grouped per task,
@@ -502,7 +752,9 @@ def build_today_timeline(db: Session, tz_name: str = "Europe/London", now_utc: d
 
     now_naive = now_utc or _utcnow()
     now_aware_utc = (
-        now_naive.replace(tzinfo=timezone.utc) if now_naive.tzinfo is None else now_naive.astimezone(timezone.utc)
+        now_naive.replace(tzinfo=timezone.utc)
+        if now_naive.tzinfo is None
+        else now_naive.astimezone(timezone.utc)
     )
     now_local = now_aware_utc.astimezone(tz)
 
@@ -523,13 +775,19 @@ def build_today_timeline(db: Session, tz_name: str = "Europe/London", now_utc: d
                 ScheduledTaskLog.created_at <= now_utc_naive,
             )
             .order_by(desc(ScheduledTaskLog.created_at))
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
 
     tasks_by_id: dict[str, ScheduledTask] = {}
     task_ids = {row.task_id for row in log_rows}
     if task_ids:
-        for task in db.execute(select(ScheduledTask).where(ScheduledTask.id.in_(task_ids))).scalars().all():
+        for task in (
+            db.execute(select(ScheduledTask).where(ScheduledTask.id.in_(task_ids)))
+            .scalars()
+            .all()
+        ):
             tasks_by_id[task.id] = task
 
     groups: dict[str, dict[str, Any]] = {}
@@ -541,7 +799,9 @@ def build_today_timeline(db: Session, tz_name: str = "Europe/London", now_utc: d
             group = {
                 "task_id": row.task_id,
                 "name": task.name if task else row.task_id,
-                "task_kind": str((task.meta or {}).get("task_kind") or "claude") if task else "claude",
+                "task_kind": str((task.meta or {}).get("task_kind") or "claude")
+                if task
+                else "claude",
                 "run_count": 0,
                 "first_ran_at": ran_at,
                 "last_ran_at": ran_at,  # newest run (first seen)
@@ -553,39 +813,47 @@ def build_today_timeline(db: Session, tz_name: str = "Europe/London", now_utc: d
         group["first_ran_at"] = ran_at  # overwritten each row → ends as the oldest
         status = row.status or "ok"
         group["status_summary"][status] = group["status_summary"].get(status, 0) + 1
-        group["runs"].append({
-            "log_id": row.id,
-            "ran_at": ran_at,
-            "status": row.status,
-            "message": row.message or "",
-            "has_output": bool(row.output_path),
-            "output_path": row.output_path,
-        })
+        group["runs"].append(
+            {
+                "log_id": row.id,
+                "ran_at": ran_at,
+                "status": row.status,
+                "message": row.message or "",
+                "has_output": bool(row.output_path),
+                "output_path": row.output_path,
+            }
+        )
 
     past = sorted(groups.values(), key=lambda g: g["last_ran_at"])
 
     # ── UPCOMING — remaining fires today per enabled task (collapsed) ──
     upcoming: list[dict[str, Any]] = []
     enabled_tasks = list(
-        db.execute(select(ScheduledTask).where(ScheduledTask.enabled.is_(True))).scalars().all()
+        db.execute(select(ScheduledTask).where(ScheduledTask.enabled.is_(True)))
+        .scalars()
+        .all()
     )
     for task in enabled_tasks:
         try:
-            fires = fires_in_window(task.cron_expr, task.timezone or tz_name, now_local, day_end_local)
+            fires = fires_in_window(
+                task.cron_expr, task.timezone or tz_name, now_local, day_end_local
+            )
         except Exception:  # noqa: BLE001 — a bad cron must not 500 the whole view
             continue
         if not fires:
             continue
         fires_local = [f.astimezone(tz) for f in fires]
-        upcoming.append({
-            "task_id": task.id,
-            "name": task.name,
-            "task_kind": str((task.meta or {}).get("task_kind") or "claude"),
-            "cron_expr": task.cron_expr,
-            "next_fire_at": fires_local[0],
-            "remaining_today": len(fires_local) - 1,
-            "fires": fires_local,
-        })
+        upcoming.append(
+            {
+                "task_id": task.id,
+                "name": task.name,
+                "task_kind": str((task.meta or {}).get("task_kind") or "claude"),
+                "cron_expr": task.cron_expr,
+                "next_fire_at": fires_local[0],
+                "remaining_today": len(fires_local) - 1,
+                "fires": fires_local,
+            }
+        )
     upcoming.sort(key=lambda u: u["next_fire_at"])
 
     return {
@@ -618,7 +886,11 @@ def _serialize_task(task: ScheduledTask) -> dict[str, Any]:
 
 
 def list_tasks(db: Session) -> list[dict[str, Any]]:
-    rows = list(db.execute(select(ScheduledTask).order_by(ScheduledTask.name.asc())).scalars().all())
+    rows = list(
+        db.execute(select(ScheduledTask).order_by(ScheduledTask.name.asc()))
+        .scalars()
+        .all()
+    )
     return [_serialize_task(row) for row in rows]
 
 
@@ -629,7 +901,9 @@ def list_task_logs(db: Session, task_id: str, limit: int = 30) -> list[dict[str,
             .where(ScheduledTaskLog.task_id == task_id)
             .order_by(desc(ScheduledTaskLog.created_at))
             .limit(max(1, min(limit, 200)))
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
     return [
         {
@@ -696,15 +970,29 @@ def _extract_json_block(text: str) -> dict[str, Any] | None:
     return None
 
 
-def _run_claude_prompt(task: ScheduledTask, goal_context: str = "") -> tuple[str, dict[str, Any], dict]:
+def _run_claude_prompt(
+    task: ScheduledTask, goal_context: str = ""
+) -> tuple[str, dict[str, Any], dict]:
     from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
     configure_sdk_auth()
 
     cwd = resolve_sdk_cwd()
-    setting_sources = parse_setting_sources(settings.claude_setting_sources, require_project=True)
+    setting_sources = parse_setting_sources(
+        settings.claude_setting_sources, require_project=True
+    )
 
-    allowed_tools = ["Skill", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Task"]
+    allowed_tools = [
+        "Skill",
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "WebSearch",
+        "WebFetch",
+        "Task",
+    ]
     if settings.agent_allow_bash:
         allowed_tools.append("Bash")
 
@@ -781,13 +1069,22 @@ def _run_claude_prompt(task: ScheduledTask, goal_context: str = "") -> tuple[str
             "env": _mcp_env,
         }
         allowed_tools.extend(_WATCHLIST_MCP_TOOLS)
+    gs_research_script = _MCP_SERVER_DIR / "gs_research.py"
+    if gs_research_script.is_file():
+        mcp_servers["gs_research"] = {
+            "type": "stdio",
+            "command": sys.executable,
+            "args": [str(gs_research_script)],
+            "env": resolve_gs_research_env(_mcp_env),
+        }
+        allowed_tools.extend(_GS_RESEARCH_MCP_TOOLS)
 
     options = ClaudeAgentOptions(
         system_prompt={
             "type": "preset",
             "preset": "claude_code",
             "append": (
-                "You are Archie, Josh's portfolio copilot and leveraged strategy operator. "
+                "You are Archie, Abhinav's portfolio copilot and leveraged strategy operator. "
                 "Always respect configured risk rails. "
                 f"Today is {datetime.now(tz=timezone.utc).strftime('%A %d %B %Y %H:%M UTC')}. "
                 "Tool routing: "
@@ -822,7 +1119,11 @@ def _run_claude_prompt(task: ScheduledTask, goal_context: str = "") -> tuple[str
         # tool calls, not the polished final report.
         last_text = ""
         cost_info: dict = {}
-        _prompt = f"{goal_context.strip()}\n\n{task.prompt}" if goal_context.strip() else task.prompt
+        _prompt = (
+            f"{goal_context.strip()}\n\n{task.prompt}"
+            if goal_context.strip()
+            else task.prompt
+        )
         async for message in query(prompt=_prompt, options=options):
             if isinstance(message, ResultMessage):
                 cost_info = {
@@ -843,8 +1144,12 @@ def _run_claude_prompt(task: ScheduledTask, goal_context: str = "") -> tuple[str
     return output, meta, cost_info
 
 
-def _cron_log_path(task_name: str, content: str, *, task_kind: str = "", description: str = "") -> str:
-    root = project_root() / ".claude" / "runtime" / "artifacts" / "scheduled" / task_name
+def _cron_log_path(
+    task_name: str, content: str, *, task_kind: str = "", description: str = ""
+) -> str:
+    root = (
+        project_root() / ".claude" / "runtime" / "artifacts" / "scheduled" / task_name
+    )
     root.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
 
@@ -862,7 +1167,15 @@ title: {description or task_name}
     return str(path)
 
 
-def _record_log(db: Session, task: ScheduledTask, *, status: str, message: str, payload: dict[str, Any], output_path: str | None) -> ScheduledTaskLog:
+def _record_log(
+    db: Session,
+    task: ScheduledTask,
+    *,
+    status: str,
+    message: str,
+    payload: dict[str, Any],
+    output_path: str | None,
+) -> ScheduledTaskLog:
     row = ScheduledTaskLog(
         task_id=task.id,
         status=status,
@@ -901,7 +1214,9 @@ def _build_goal_context(db: Session, task: ScheduledTask) -> str:
         return 0.0
 
     target = _pick_num(goal.get("target_gbp"), policy.get("daily_profit_target_gbp"))
-    loss_limit = _pick_num(goal.get("loss_limit_gbp"), policy.get("daily_loss_limit_gbp"))
+    loss_limit = _pick_num(
+        goal.get("loss_limit_gbp"), policy.get("daily_loss_limit_gbp")
+    )
     try:
         max_trades = int(goal.get("max_trades") or policy.get("max_daily_trades") or 0)
     except (TypeError, ValueError):
@@ -964,7 +1279,7 @@ def _build_goal_context(db: Session, task: ScheduledTask) -> str:
         if picks:
             rows = ", ".join(
                 f"{p['underlying']} {p['direction']} ({p['etp_ticker']}, "
-                f"{p['move_pct']*100:+.0f}% vs 50d)"
+                f"{p['move_pct'] * 100:+.0f}% vs 50d)"
                 for p in picks
             )
             lines.append(f"- CANDIDATE UNIVERSE (regime-gated movers): {rows}")
@@ -977,7 +1292,9 @@ def _build_goal_context(db: Session, task: ScheduledTask) -> str:
             "new positions (managing/closing existing ones is fine)."
         )
     else:
-        lines.append("- PROFIT TARGET: none set — optimise risk-adjusted return without overtrading.")
+        lines.append(
+            "- PROFIT TARGET: none set — optimise risk-adjusted return without overtrading."
+        )
     if loss_limit > 0:
         lines.append(
             f"- LOSS LIMIT: £{loss_limit:,.2f} per {window}. If today's REALIZED P&L <= -£{loss_limit:,.2f}, "
@@ -1023,7 +1340,9 @@ def _build_goal_context(db: Session, task: ScheduledTask) -> str:
             )
             lines.append(f"- HELD LEVERAGED POSITIONS ({len(held)}): {summary}")
         else:
-            lines.append("- HELD LEVERAGED POSITIONS: none detected (or T212 unavailable this run).")
+            lines.append(
+                "- HELD LEVERAGED POSITIONS: none detected (or T212 unavailable this run)."
+            )
     except Exception:  # noqa: BLE001
         pass
 
@@ -1099,7 +1418,9 @@ def _render_watch_md(result: dict[str, Any]) -> str:
         "# Watch Cycle",
         f"_{stamp}_",
         "",
-        f"Raised **{created}** new alert(s)." if created else "No new alerts — nothing crossed a threshold.",
+        f"Raised **{created}** new alert(s)."
+        if created
+        else "No new alerts — nothing crossed a threshold.",
     ]
     if by_cat:
         lines.append("")
@@ -1127,10 +1448,17 @@ def _render_rebalance_md(plan: dict[str, Any]) -> str:
         "",
     ]
     if trades:
-        lines += ["| Side | Ticker | Account | Notional | Current → Target |", "|---|---|---|---|---|"]
+        lines += [
+            "| Side | Ticker | Account | Notional | Current → Target |",
+            "|---|---|---|---|---|",
+        ]
         for t in trades:
             cur = f"{(t.get('current_weight') or 0):.1%}"
-            tgt = f"{(t.get('target_weight') or 0):.0%}" if t.get("target_weight") else "—"
+            tgt = (
+                f"{(t.get('target_weight') or 0):.0%}"
+                if t.get("target_weight")
+                else "—"
+            )
             lines.append(
                 f"| {t.get('side')} | {t.get('ticker')} | {t.get('account_kind')} | "
                 f"£{float(t.get('est_notional') or 0):,.0f} | {cur} → {tgt} |"
@@ -1172,7 +1500,9 @@ def _render_leveraged_scan_md(result: dict[str, Any]) -> str:
     if signals:
         lines.append("## Proposed setups")
         lines.append("")
-        lines.append("| Symbol | Direction | Ref price | Notional | Conf. | Exp. edge | SL / TP |")
+        lines.append(
+            "| Symbol | Direction | Ref price | Notional | Conf. | Exp. edge | SL / TP |"
+        )
         lines.append("|---|---|---|---|---|---|---|")
         for s in signals:
             sl_tp = f"{_fmt_pct(-abs(float(s.get('stop_loss_pct') or 0)))} / {_fmt_pct(s.get('take_profit_pct'))}"
@@ -1234,26 +1564,34 @@ def _render_leveraged_cycle_md(result: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _run_task_impl(db: Session, task: ScheduledTask) -> tuple[str, dict[str, Any], str | None, dict]:
+def _run_task_impl(
+    db: Session, task: ScheduledTask
+) -> tuple[str, dict[str, Any], str | None, dict]:
     kind = str((task.meta or {}).get("task_kind") or "claude").strip().lower()
     description = str((task.meta or {}).get("description") or task.name)
 
     if kind == "leveraged_cycle":
         result = run_leveraged_cycle(db, source_task_id=task.id)
         content = _render_leveraged_cycle_md(result)
-        path = _cron_log_path(task.name, content, task_kind=kind, description=description)
+        path = _cron_log_path(
+            task.name, content, task_kind=kind, description=description
+        )
         return "ok", {"result": result}, path, {}
 
     if kind == "leveraged_scan":
         result = scan_signals(db, source_task_id=task.id)
         content = _render_leveraged_scan_md(result)
-        path = _cron_log_path(task.name, content, task_kind=kind, description=description)
+        path = _cron_log_path(
+            task.name, content, task_kind=kind, description=description
+        )
         return "ok", {"result": result}, path, {}
 
     if kind == "leveraged_monitor":
         result = monitor_open_trades(db)
         content = _render_leveraged_monitor_md(result)
-        path = _cron_log_path(task.name, content, task_kind=kind, description=description)
+        path = _cron_log_path(
+            task.name, content, task_kind=kind, description=description
+        )
         return "ok", {"result": result}, path, {}
 
     if kind == "portfolio_rebalance":
@@ -1263,7 +1601,9 @@ def _run_task_impl(db: Session, task: ScheduledTask) -> tuple[str, dict[str, Any
 
         result = propose_rebalance(db, account_kind="all")
         content = _render_rebalance_md(result)
-        path = _cron_log_path(task.name, content, task_kind=kind, description=description)
+        path = _cron_log_path(
+            task.name, content, task_kind=kind, description=description
+        )
         return "ok", {"result": result}, path, {}
 
     if kind == "watch_cycle":
@@ -1273,12 +1613,16 @@ def _run_task_impl(db: Session, task: ScheduledTask) -> tuple[str, dict[str, Any
 
         result = run_watches(db)
         content = _render_watch_md(result)
-        path = _cron_log_path(task.name, content, task_kind=kind, description=description)
+        path = _cron_log_path(
+            task.name, content, task_kind=kind, description=description
+        )
         return "ok", {"result": result}, path, {}
 
     goal_context = _build_goal_context(db, task) if kind == "claude_with_goal" else ""
     output, meta, cost_info = _run_claude_prompt(task, goal_context=goal_context)
-    path = _cron_log_path(task.name, output or "(no output)", task_kind=kind, description=description)
+    path = _cron_log_path(
+        task.name, output or "(no output)", task_kind=kind, description=description
+    )
 
     policy_updates = None
     parsed = meta.get("json") if isinstance(meta.get("json"), dict) else None
@@ -1303,12 +1647,42 @@ def _run_task_impl(db: Session, task: ScheduledTask) -> tuple[str, dict[str, Any
         except Exception as exc:  # noqa: BLE001 — bookkeeping must never fail the run
             logger.warning("alpha-loop proposal persistence failed: %s", exc)
 
+    # GS fusion: queue compliance-clean ISA ideas as proposals, then push the
+    # punchy summary to Telegram so Abhinav gets the fused read on his phone.
+    if kind == "gs_fusion" and not block_reason:
+        try:
+            persisted = _persist_fusion_proposals(db, task, parsed)
+            if persisted.get("created") or persisted.get("skipped_preclearance"):
+                payload["proposals_persisted"] = persisted
+        except Exception as exc:  # noqa: BLE001 — bookkeeping must never fail the run
+            logger.warning("gs-fusion proposal persistence failed: %s", exc)
+        try:
+            summary = ""
+            if isinstance(parsed, dict):
+                summary = str(parsed.get("telegram_summary") or "").strip()
+            if not summary:
+                summary = (output or "").strip()
+            if summary:
+                from app.services.telegram_service import send_telegram_notification
+
+                header = "*GS Fusion Brief*\n\n"
+                sent = send_telegram_notification(db, (header + summary)[:3900])
+                payload["telegram_sent"] = bool(sent)
+        except Exception as exc:  # noqa: BLE001 — Telegram must never fail the run
+            logger.warning("gs-fusion telegram delivery failed: %s", exc)
+
     # A2 — deterministic continuity line for every goal pass (success OR blocked),
     # so the next pass opens with state regardless of what the agent wrote.
     if kind == "claude_with_goal":
         try:
-            action = f"BLOCKED: {block_reason}" if block_reason else _goal_action_summary(parsed, output)
-            payload["continuity_log"] = append_daily_goal_line(db, task_name=task.name, action=action)
+            action = (
+                f"BLOCKED: {block_reason}"
+                if block_reason
+                else _goal_action_summary(parsed, output)
+            )
+            payload["continuity_log"] = append_daily_goal_line(
+                db, task_name=task.name, action=action
+            )
         except Exception as exc:  # noqa: BLE001 — never fail the run on bookkeeping
             logger.warning("alpha-loop continuity write failed: %s", exc)
 
@@ -1321,7 +1695,9 @@ def _run_task_impl(db: Session, task: ScheduledTask) -> tuple[str, dict[str, Any
     return "ok", payload, path, cost_info
 
 
-def _touch_task_after_run(db: Session, task: ScheduledTask, *, status: str, blocked: bool = False) -> None:
+def _touch_task_after_run(
+    db: Session, task: ScheduledTask, *, status: str, blocked: bool = False
+) -> None:
     now = _utcnow()
     task.last_run_at = now
     task.last_status = status
@@ -1363,7 +1739,10 @@ def run_task_now(db: Session, task_id: str) -> dict[str, Any]:
             payload=payload,
             output_path=output_path,
         )
-        if cost_info.get("total_cost_usd") is not None or cost_info.get("duration_ms") is not None:
+        if (
+            cost_info.get("total_cost_usd") is not None
+            or cost_info.get("duration_ms") is not None
+        ):
             costs_service.record(
                 db,
                 source="scheduled",
@@ -1375,11 +1754,25 @@ def run_task_now(db: Session, task_id: str) -> dict[str, Any]:
             )
         _touch_task_after_run(db, task, status=status, blocked=blocked)
         db.refresh(task)
-        return {"task": _serialize_task(task), "status": status, "payload": payload, "output_path": output_path}
+        return {
+            "task": _serialize_task(task),
+            "status": status,
+            "payload": payload,
+            "output_path": output_path,
+        }
     except Exception as exc:  # noqa: BLE001
         message = str(exc)
-        _record_log(db, task, status="error", message=message, payload={"error": message}, output_path=None)
-        _touch_task_after_run(db, task, status="error", blocked=_is_transient_error(message))
+        _record_log(
+            db,
+            task,
+            status="error",
+            message=message,
+            payload={"error": message},
+            output_path=None,
+        )
+        _touch_task_after_run(
+            db, task, status="error", blocked=_is_transient_error(message)
+        )
         raise
 
 
@@ -1422,7 +1815,10 @@ def start_task_background(db: Session, task_id: str) -> dict[str, Any]:
                     payload=payload,
                     output_path=output_path,
                 )
-                if cost_info.get("total_cost_usd") is not None or cost_info.get("duration_ms") is not None:
+                if (
+                    cost_info.get("total_cost_usd") is not None
+                    or cost_info.get("duration_ms") is not None
+                ):
                     costs_service.record(
                         bg_db,
                         source="scheduled",
@@ -1435,8 +1831,17 @@ def start_task_background(db: Session, task_id: str) -> dict[str, Any]:
                 _touch_task_after_run(bg_db, bg_task, status=status, blocked=blocked)
             except Exception as exc:  # noqa: BLE001
                 message = str(exc)
-                _record_log(bg_db, bg_task, status="error", message=message, payload={"error": message}, output_path=None)
-                _touch_task_after_run(bg_db, bg_task, status="error", blocked=_is_transient_error(message))
+                _record_log(
+                    bg_db,
+                    bg_task,
+                    status="error",
+                    message=message,
+                    payload={"error": message},
+                    output_path=None,
+                )
+                _touch_task_after_run(
+                    bg_db, bg_task, status="error", blocked=_is_transient_error(message)
+                )
         finally:
             bg_db.close()
 
@@ -1452,9 +1857,12 @@ def run_due_tasks(db: Session) -> list[dict[str, Any]]:
         db.execute(
             select(ScheduledTask).where(
                 ScheduledTask.enabled.is_(True),
-                (ScheduledTask.next_run_at.is_(None)) | (ScheduledTask.next_run_at <= now),
+                (ScheduledTask.next_run_at.is_(None))
+                | (ScheduledTask.next_run_at <= now),
             )
-        ).scalars().all()
+        )
+        .scalars()
+        .all()
     )
 
     results: list[dict[str, Any]] = []
@@ -1471,7 +1879,9 @@ def create_task(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
     if not name:
         raise RuntimeError("task name is required")
 
-    exists = db.execute(select(ScheduledTask).where(ScheduledTask.name == name)).scalar_one_or_none()
+    exists = db.execute(
+        select(ScheduledTask).where(ScheduledTask.name == name)
+    ).scalar_one_or_none()
     if exists:
         raise RuntimeError(f"task with name '{name}' already exists")
 
@@ -1479,7 +1889,9 @@ def create_task(db: Session, payload: dict[str, Any]) -> dict[str, Any]:
     if not cron_expr:
         raise RuntimeError("cron_expr is required")
 
-    timezone_name = str(payload.get("timezone", "Europe/London") or "Europe/London").strip()
+    timezone_name = str(
+        payload.get("timezone", "Europe/London") or "Europe/London"
+    ).strip()
     _ = _next_run_utc(cron_expr, timezone_name)
 
     task = ScheduledTask(
@@ -1509,7 +1921,9 @@ def update_task(db: Session, task_id: str, patch: dict[str, Any]) -> dict[str, A
         if not name:
             raise RuntimeError("task name cannot be empty")
         other = db.execute(
-            select(ScheduledTask).where(ScheduledTask.name == name, ScheduledTask.id != task.id)
+            select(ScheduledTask).where(
+                ScheduledTask.name == name, ScheduledTask.id != task.id
+            )
         ).scalar_one_or_none()
         if other:
             raise RuntimeError(f"task name '{name}' already exists")
@@ -1519,7 +1933,9 @@ def update_task(db: Session, task_id: str, patch: dict[str, Any]) -> dict[str, A
         task.cron_expr = str(patch.get("cron_expr") or task.cron_expr).strip()
 
     if "timezone" in patch:
-        task.timezone = str(patch.get("timezone") or task.timezone).strip() or "Europe/London"
+        task.timezone = (
+            str(patch.get("timezone") or task.timezone).strip() or "Europe/London"
+        )
 
     if "model" in patch:
         task.model = str(patch.get("model") or task.model).strip() or task.model
@@ -1546,7 +1962,11 @@ def delete_task(db: Session, task_id: str) -> bool:
     if not task:
         return False
 
-    logs = list(db.execute(select(ScheduledTaskLog).where(ScheduledTaskLog.task_id == task_id)).scalars().all())
+    logs = list(
+        db.execute(select(ScheduledTaskLog).where(ScheduledTaskLog.task_id == task_id))
+        .scalars()
+        .all()
+    )
     for row in logs:
         db.delete(row)
     db.delete(task)
@@ -1557,11 +1977,15 @@ def delete_task(db: Session, task_id: str) -> bool:
 def seed_default_tasks(db: Session) -> list[dict[str, Any]]:
     created: list[dict[str, Any]] = []
     for item in _DEFAULT_TASKS:
-        existing = db.execute(select(ScheduledTask).where(ScheduledTask.name == item["name"])).scalar_one_or_none()
+        existing = db.execute(
+            select(ScheduledTask).where(ScheduledTask.name == item["name"])
+        ).scalar_one_or_none()
         if existing:
             # Ensure next_run_at is initialized for older rows.
             if existing.next_run_at is None:
-                existing.next_run_at = _next_run_utc(existing.cron_expr, existing.timezone)
+                existing.next_run_at = _next_run_utc(
+                    existing.cron_expr, existing.timezone
+                )
                 db.add(existing)
                 db.commit()
             continue

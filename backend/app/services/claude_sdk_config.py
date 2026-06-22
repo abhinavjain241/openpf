@@ -55,29 +55,61 @@ def resolve_t212_env() -> dict[str, str]:
 
         with SessionLocal() as db:
             store = ConfigStore(db)
-            env["T212_BASE_ENV"] = str(store.get_broker().get("t212_base_env") or settings.t212_base_env)
+            env["T212_BASE_ENV"] = str(
+                store.get_broker().get("t212_base_env") or settings.t212_base_env
+            )
             ic = store.get_account_credentials("invest")
             sc = store.get_account_credentials("stocks_isa")
-            invest = (str(ic.get("t212_api_key", "")).strip(), str(ic.get("t212_api_secret", "")).strip())
-            isa = (str(sc.get("t212_api_key", "")).strip(), str(sc.get("t212_api_secret", "")).strip())
+            invest = (
+                str(ic.get("t212_api_key", "")).strip(),
+                str(ic.get("t212_api_secret", "")).strip(),
+            )
+            isa = (
+                str(sc.get("t212_api_key", "")).strip(),
+                str(sc.get("t212_api_secret", "")).strip(),
+            )
             # Dedicated IP-restricted execution (write) keys — injected separately so
             # Archie's reads keep working even when the exec key's IP allowlist is stale.
             xic = store.get_account_exec_credentials("invest")
             xsc = store.get_account_exec_credentials("stocks_isa")
-            invest_exec = (str(xic.get("t212_api_key", "")).strip(), str(xic.get("t212_api_secret", "")).strip())
-            isa_exec = (str(xsc.get("t212_api_key", "")).strip(), str(xsc.get("t212_api_secret", "")).strip())
+            invest_exec = (
+                str(xic.get("t212_api_key", "")).strip(),
+                str(xic.get("t212_api_secret", "")).strip(),
+            )
+            isa_exec = (
+                str(xsc.get("t212_api_key", "")).strip(),
+                str(xsc.get("t212_api_secret", "")).strip(),
+            )
     except Exception:  # noqa: BLE001 — fall back to .env below
         pass
 
     if not all(invest):
         invest = (
-            (settings.t212_invest_api_key or settings.t212_api_key_invest or settings.t212_api_key or "").strip(),
-            (settings.t212_invest_api_secret or settings.t212_api_secret_invest or settings.t212_api_secret or "").strip(),
+            (
+                settings.t212_invest_api_key
+                or settings.t212_api_key_invest
+                or settings.t212_api_key
+                or ""
+            ).strip(),
+            (
+                settings.t212_invest_api_secret
+                or settings.t212_api_secret_invest
+                or settings.t212_api_secret
+                or ""
+            ).strip(),
         )
     if not all(isa):
         isa = (
-            (settings.t212_stocks_isa_api_key or settings.t212_api_key_stocks_isa or "").strip(),
-            (settings.t212_stocks_isa_api_secret or settings.t212_api_secret_stocks_isa or "").strip(),
+            (
+                settings.t212_stocks_isa_api_key
+                or settings.t212_api_key_stocks_isa
+                or ""
+            ).strip(),
+            (
+                settings.t212_stocks_isa_api_secret
+                or settings.t212_api_secret_stocks_isa
+                or ""
+            ).strip(),
         )
     if not all(invest_exec):
         invest_exec = (
@@ -95,9 +127,28 @@ def resolve_t212_env() -> dict[str, str]:
     if all(isa):
         env["T212_API_KEY_STOCKS_ISA"], env["T212_API_SECRET_STOCKS_ISA"] = isa
     if all(invest_exec):
-        env["T212_EXEC_API_KEY_INVEST"], env["T212_EXEC_API_SECRET_INVEST"] = invest_exec
+        env["T212_EXEC_API_KEY_INVEST"], env["T212_EXEC_API_SECRET_INVEST"] = (
+            invest_exec
+        )
     if all(isa_exec):
-        env["T212_EXEC_API_KEY_STOCKS_ISA"], env["T212_EXEC_API_SECRET_STOCKS_ISA"] = isa_exec
+        env["T212_EXEC_API_KEY_STOCKS_ISA"], env["T212_EXEC_API_SECRET_STOCKS_ISA"] = (
+            isa_exec
+        )
+    return env
+
+
+def resolve_gs_research_env(base: dict[str, str]) -> dict[str, str]:
+    """Env for the gs_research MCP subprocess: the shared MCP env (PYTHONPATH +
+    DATABASE_URL, so it can import `app` and read ConfigStore) plus any explicit
+    ``GS_RESEARCH_DIR`` / ``GS_PORTFOLIO_CONFIG`` / ``GS_UNIVERSE_CSV`` overrides
+    forwarded from this process. When none are set the service falls back to
+    ConfigStore and finally the sibling-repo default.
+    """
+    env = dict(base)
+    for var in ("GS_RESEARCH_DIR", "GS_PORTFOLIO_CONFIG", "GS_UNIVERSE_CSV"):
+        val = os.environ.get(var, "").strip()
+        if val:
+            env[var] = val
     return env
 
 
@@ -111,7 +162,9 @@ def project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
-def parse_setting_sources(raw: str | None, *, require_project: bool = True) -> list[str]:
+def parse_setting_sources(
+    raw: str | None, *, require_project: bool = True
+) -> list[str]:
     if raw is None:
         raw = settings.claude_setting_sources
 
@@ -172,7 +225,9 @@ def resolve_sdk_cwd() -> Path:
     dst_claude_md = dst_hidden / "CLAUDE.md"
     if src_claude_md.exists() and not dst_claude_md.exists():
         dst_claude_md.parent.mkdir(parents=True, exist_ok=True)
-        dst_claude_md.write_text(src_claude_md.read_text(encoding="utf-8"), encoding="utf-8")
+        dst_claude_md.write_text(
+            src_claude_md.read_text(encoding="utf-8"), encoding="utf-8"
+        )
 
     return cwd
 
@@ -200,7 +255,7 @@ def list_skill_files(cwd: Path | None = None) -> list[str]:
 # truth and avoid circular imports.
 # ──────────────────────────────────────────────────────────────────────────
 
-_T212_MCP_TOOLS = [
+_T212_MCP_TOOLS: list[str] = [
     "mcp__trading212__get_account_summary",
     "mcp__trading212__get_positions",
     "mcp__trading212__get_pending_orders",
@@ -218,7 +273,7 @@ _T212_MCP_TOOLS = [
     "mcp__trading212__get_csv_export_status",
 ]
 
-_MARKET_MCP_TOOLS = [
+_MARKET_MCP_TOOLS: list[str] = [
     "mcp__marketdata__get_price_snapshot",
     "mcp__marketdata__get_price_history_rows",
     "mcp__marketdata__get_technical_snapshot",
@@ -228,7 +283,7 @@ _MARKET_MCP_TOOLS = [
     "mcp__marketdata__compare_assets",
 ]
 
-_SCHEDULER_MCP_TOOLS = [
+_SCHEDULER_MCP_TOOLS: list[str] = [
     "mcp__scheduler__list_scheduled_tasks",
     "mcp__scheduler__create_scheduled_task",
     "mcp__scheduler__pause_scheduled_task",
@@ -257,6 +312,16 @@ _INTEL_MCP_TOOLS = [
     "mcp__intel__get_market_news",
     "mcp__intel__get_macro_snapshot",
     "mcp__intel__get_earnings",
+]
+
+_GS_RESEARCH_MCP_TOOLS = [
+    "mcp__gs_research__get_gs_research_status",
+    "mcp__gs_research__list_gs_briefs",
+    "mcp__gs_research__get_latest_gs_brief",
+    "mcp__gs_research__get_gs_brief",
+    "mcp__gs_research__get_gs_trade_ideas",
+    "mcp__gs_research__get_compliance_rules",
+    "mcp__gs_research__check_preclearance",
 ]
 
 _WATCHLIST_MCP_TOOLS = [
@@ -299,6 +364,13 @@ _RESEARCHER_PROMPT = (
     "get_valuation, get_financial_statements, get_earnings_calendar) for company facts, valuation "
     "ratios, financial statements, and earnings dates. Prefer these over web pages for any numeric "
     "market/financial data — never quote a price or metric you did not fetch this run.\n\n"
+    "You also have the gs_research tools (get_latest_gs_brief, get_gs_trade_ideas, get_gs_brief, "
+    "list_gs_briefs, get_gs_research_status, get_compliance_rules, check_preclearance): the user's "
+    "daily Goldman Sachs Marquee desk research and their OWN preclearance compliance rules. Use them "
+    "when a question touches market colour, desk views, or trade ideas — cite the brief date and check "
+    "freshness (stale_days), and only surface ideas that are compliance-clean. get_compliance_rules "
+    "gives the policy; check_preclearance gives the authoritative per-instrument verdict — use it to "
+    "confirm a SPECIFIC name before recommending it.\n\n"
     "Data quality: if any series looks synthetic or implausible (e.g. a smooth random-walk with no "
     "gaps/weekends, round-number prices, zero volume, or values that contradict a reliable source), "
     "FLAG it explicitly rather than reporting it as fact. Distinguish what you verified from what you "
@@ -339,7 +411,7 @@ _EXECUTION_PROMPT = (
     "error mentioning IP restriction means the key's allowlist is stale — surface "
     "that verbatim in `errors`, do not retry.) "
     "Always finish with a single JSON block matching the execution "
-    "schema: {\"trades\": [...], \"errors\": [...], \"commentary\": \"...\"}. "
+    'schema: {"trades": [...], "errors": [...], "commentary": "..."}. '
     "Return structured JSON only — never unstructured prose as the final answer."
 )
 
@@ -361,7 +433,18 @@ def build_subagents() -> dict[str, Any]:
             "structured research findings and writes artifacts when useful."
         ),
         prompt=_RESEARCHER_PROMPT,
-        tools=["WebSearch", "WebFetch", "Read", "Glob", "Grep", "Write", *_MARKET_MCP_TOOLS, *_FUNDAMENTALS_MCP_TOOLS, *_INTEL_MCP_TOOLS],
+        tools=[
+            "WebSearch",
+            "WebFetch",
+            "Read",
+            "Glob",
+            "Grep",
+            "Write",
+            *_MARKET_MCP_TOOLS,
+            *_FUNDAMENTALS_MCP_TOOLS,
+            *_INTEL_MCP_TOOLS,
+            *_GS_RESEARCH_MCP_TOOLS,
+        ],
         model="sonnet",
     )
 
@@ -374,7 +457,17 @@ def build_subagents() -> dict[str, Any]:
             "analysis is needed."
         ),
         prompt=_QUANT_PROMPT,
-        tools=["Read", "Write", "Edit", "Glob", "Grep", "Bash", *_MARKET_MCP_TOOLS, *_FORECAST_MCP_TOOLS, *_FUNDAMENTALS_MCP_TOOLS],
+        tools=[
+            "Read",
+            "Write",
+            "Edit",
+            "Glob",
+            "Grep",
+            "Bash",
+            *_MARKET_MCP_TOOLS,
+            *_FORECAST_MCP_TOOLS,
+            *_FUNDAMENTALS_MCP_TOOLS,
+        ],
         model="claude-opus-4-8",
     )
 
@@ -416,7 +509,10 @@ _BASH_DENY = [
 _SECRET_PATTERNS = [
     (re.compile(r"(^|/)\.env(\.|$|\b)"), ".env files contain secrets"),
     (re.compile(r"\bid_rsa\b|\.pem\b|\.key\b"), "private keys are protected"),
-    (re.compile(r"\b(secrets?|credentials?)\b", re.IGNORECASE), "credential files are protected"),
+    (
+        re.compile(r"\b(secrets?|credentials?)\b", re.IGNORECASE),
+        "credential files are protected",
+    ),
 ]
 
 
@@ -430,7 +526,9 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
-async def _bash_guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
+async def _bash_guard(
+    input_data: dict[str, Any], tool_use_id: str | None, context: Any
+) -> dict[str, Any]:
     command = str((input_data.get("tool_input") or {}).get("command", ""))
     for pattern, reason in _BASH_DENY:
         if pattern.search(command):
@@ -441,7 +539,9 @@ async def _bash_guard(input_data: dict[str, Any], tool_use_id: str | None, conte
     return {}
 
 
-async def _file_guard(input_data: dict[str, Any], tool_use_id: str | None, context: Any) -> dict[str, Any]:
+async def _file_guard(
+    input_data: dict[str, Any], tool_use_id: str | None, context: Any
+) -> dict[str, Any]:
     tool_input = input_data.get("tool_input") or {}
     target = " ".join(
         str(tool_input.get(k, ""))
@@ -476,7 +576,9 @@ def runtime_info() -> dict[str, Any]:
     return {
         "project_root": str(project_root()),
         "cwd": str(cwd),
-        "setting_sources": parse_setting_sources(settings.claude_setting_sources, require_project=True),
+        "setting_sources": parse_setting_sources(
+            settings.claude_setting_sources, require_project=True
+        ),
         "skills_dir": str(cwd / ".claude" / "skills"),
         "skill_files": list_skill_files(cwd),
         "claude_model": settings.claude_model,

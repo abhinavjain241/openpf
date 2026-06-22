@@ -16,10 +16,10 @@ from claude_agent_sdk import CanUseTool, PermissionResultAllow, PermissionResult
 from app.core.config import get_settings
 from app.services.claude_sdk_config import (
     build_security_hooks, build_subagents, configure_sdk_auth, parse_setting_sources, resolve_sdk_cwd,
-    resolve_t212_env,
+    resolve_gs_research_env, resolve_t212_env,
     runtime_info as sdk_runtime_info,
     _T212_MCP_TOOLS, _MARKET_MCP_TOOLS, _SCHEDULER_MCP_TOOLS, _FORECAST_MCP_TOOLS,
-    _FUNDAMENTALS_MCP_TOOLS, _INTEL_MCP_TOOLS, _WATCHLIST_MCP_TOOLS,
+    _FUNDAMENTALS_MCP_TOOLS, _INTEL_MCP_TOOLS, _WATCHLIST_MCP_TOOLS, _GS_RESEARCH_MCP_TOOLS,
 )
 
 settings = get_settings()
@@ -83,6 +83,14 @@ _TOOL_LABELS: dict[str, str] = {
     "mcp__watchlist__update_watchlist_item": "Updating a watchlist item",
     "mcp__watchlist__remove_from_watchlist": "Removing from the watchlist",
     "mcp__watchlist__flag_watchlist_item": "Flagging a watchlist item",
+    # GS research MCP tools
+    "mcp__gs_research__get_gs_research_status": "Checking GS research feed",
+    "mcp__gs_research__list_gs_briefs": "Listing GS briefs",
+    "mcp__gs_research__get_latest_gs_brief": "Reading latest GS brief",
+    "mcp__gs_research__get_gs_brief": "Reading GS brief",
+    "mcp__gs_research__get_gs_trade_ideas": "Reading GS trade ideas",
+    "mcp__gs_research__get_compliance_rules": "Checking compliance rules",
+    "mcp__gs_research__check_preclearance": "Checking preclearance verdict",
 }
 
 
@@ -407,6 +415,19 @@ class ClaudeChatRuntime:
             }
             allowed_tools.extend(_WATCHLIST_MCP_TOOLS)
 
+        # GS research MCP — bridges the gs-summarize pipeline output (daily GS
+        # Marquee briefs + trade ideas + the user's preclearance rules) so Archie
+        # can fuse desk research with the live book. Reads files via gs_research_service.
+        gs_research_script = _MCP_SERVER_DIR / "gs_research.py"
+        if gs_research_script.is_file():
+            mcp_servers["gs_research"] = {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": [str(gs_research_script)],
+                "env": resolve_gs_research_env(_mcp_env),
+            }
+            allowed_tools.extend(_GS_RESEARCH_MCP_TOOLS)
+
         self._info = {
             **runtime,
             "allowed_tools": allowed_tools,
@@ -420,14 +441,14 @@ class ClaudeChatRuntime:
                 "type": "preset",
                 "preset": "claude_code",
                 "append": (
-                    "You are Archie, Josh's portfolio copilot on the MyPF dashboard. "
+                    "You are Archie, Abhinav's portfolio copilot on the MyPF dashboard. "
                     "Explain clearly, highlight risk, and give actionable next steps. "
                     "Your identity and memory guidelines are in your project CLAUDE.md. "
                     "You have MCP market data tools for spot/historical/technical data, "
                     "fundamentals tools (get_fundamentals, get_valuation, get_financial_statements, "
                     "get_earnings_calendar) for company facts, valuation ratios, statements, and earnings, "
                     "scheduler tools for cron task management, watchlist tools "
-                    "(list/add/update/remove + flag) for Josh's tracked-ideas board, and a Kronos forecasting "
+                    "(list/add/update/remove + flag) for Abhinav's tracked-ideas board, and a Kronos forecasting "
                     "tool (forecast_prices) that projects a holding's close price over a "
                     "future horizon with p10/p50/p90 uncertainty bands. Treat forecasts as "
                     "probabilistic analysis with clear uncertainty, never as certainties or "
@@ -448,6 +469,14 @@ class ClaudeChatRuntime:
                     "When you recommend a name worth tracking (not an immediate trade), add it to the watchlist "
                     "with add_to_watchlist and a concise note of WHY — that note is the condition the watch "
                     "service later checks, so the idea resurfaces instead of being forgotten. "
+                    "You also have gs_research tools that bring in Abhinav's daily Goldman Sachs Marquee desk "
+                    "research (get_latest_gs_brief, get_gs_trade_ideas) plus his OWN preclearance compliance "
+                    "rules (get_compliance_rules) and an authoritative per-instrument verdict (check_preclearance). "
+                    "When asked for market colour, desk views, or to act on the "
+                    "GS brief, FUSE it with the live book: map ideas onto held names, flag risks to current "
+                    "positions, cite the brief date, and only surface ideas that are compliance-clean (prefer "
+                    "broad ETFs / index products needing no preclearance over single stocks). Before recommending "
+                    "a specific name, confirm its verdict with check_preclearance. "
                     "Do not claim a capability is unavailable before checking available tools."
                 ),
             },

@@ -12,9 +12,9 @@ from typing import Any
 from app.core.config import get_settings
 from app.services.claude_sdk_config import (
     build_security_hooks, build_subagents, configure_sdk_auth,
-    parse_setting_sources, project_root, resolve_sdk_cwd, resolve_t212_env,
+    parse_setting_sources, project_root, resolve_gs_research_env, resolve_sdk_cwd, resolve_t212_env,
     _T212_MCP_TOOLS, _MARKET_MCP_TOOLS, _SCHEDULER_MCP_TOOLS, _FORECAST_MCP_TOOLS,
-    _FUNDAMENTALS_MCP_TOOLS, _INTEL_MCP_TOOLS,
+    _FUNDAMENTALS_MCP_TOOLS, _INTEL_MCP_TOOLS, _GS_RESEARCH_MCP_TOOLS,
 )
 from app.services.research_service import fetch_news, fetch_x_posts, web_search
 
@@ -305,6 +305,15 @@ def run_claude_analyst_cycle(snapshot: dict[str, Any], watchlist: list[str], ris
                 "env": _mcp_env,
             }
             allowed_tools.extend(_INTEL_MCP_TOOLS)
+        gs_research_script = _MCP_SERVER_DIR / "gs_research.py"
+        if gs_research_script.is_file():
+            mcp_servers["gs_research"] = {
+                "type": "stdio",
+                "command": sys.executable,
+                "args": [str(gs_research_script)],
+                "env": resolve_gs_research_env(_mcp_env),
+            }
+            allowed_tools.extend(_GS_RESEARCH_MCP_TOOLS)
 
         options = ClaudeAgentOptions(
             system_prompt=(
@@ -331,7 +340,7 @@ def run_claude_analyst_cycle(snapshot: dict[str, Any], watchlist: list[str], ris
                 "(3) a regime caveat tying it back to the regime you established. "
                 "Flag concentration, liquidity, and downside risk. "
                 "This is ANALYSIS ONLY — never execute and never imply a trade has been executed; "
-                "intents are proposals for Josh to approve."
+                "intents are proposals for Abhinav to approve."
             ),
             model=settings.claude_agent_model,
             cwd=str(sdk_cwd),
