@@ -27,7 +27,9 @@ from app.services.task_scheduler_service import (
 )
 
 # ── Logging (file-based — stdout is reserved for MCP protocol) ──
-_LOG_DIR = Path(os.environ.get("MCP_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs"))
+_LOG_DIR = Path(
+    os.environ.get("MCP_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs")
+)
 try:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
 except OSError:

@@ -34,8 +34,18 @@ BROKER_DEFAULT = {
 CREDENTIALS_DEFAULT = {
     "invest": {
         # READ key (IP-unrestricted): used for every read-only call.
-        "t212_api_key": str(settings.t212_invest_api_key or settings.t212_api_key_invest or settings.t212_api_key or "").strip(),
-        "t212_api_secret": str(settings.t212_invest_api_secret or settings.t212_api_secret_invest or settings.t212_api_secret or "").strip(),
+        "t212_api_key": str(
+            settings.t212_invest_api_key
+            or settings.t212_api_key_invest
+            or settings.t212_api_key
+            or ""
+        ).strip(),
+        "t212_api_secret": str(
+            settings.t212_invest_api_secret
+            or settings.t212_api_secret_invest
+            or settings.t212_api_secret
+            or ""
+        ).strip(),
         "enabled": True,
         # EXECUTION key (IP-restricted): used only for placing/cancelling orders.
         "exec_api_key": str(settings.t212_exec_invest_api_key or "").strip(),
@@ -43,8 +53,14 @@ CREDENTIALS_DEFAULT = {
         "exec_enabled": True,
     },
     "stocks_isa": {
-        "t212_api_key": str(settings.t212_stocks_isa_api_key or settings.t212_api_key_stocks_isa or "").strip(),
-        "t212_api_secret": str(settings.t212_stocks_isa_api_secret or settings.t212_api_secret_stocks_isa or "").strip(),
+        "t212_api_key": str(
+            settings.t212_stocks_isa_api_key or settings.t212_api_key_stocks_isa or ""
+        ).strip(),
+        "t212_api_secret": str(
+            settings.t212_stocks_isa_api_secret
+            or settings.t212_api_secret_stocks_isa
+            or ""
+        ).strip(),
         "enabled": True,
         "exec_api_key": str(settings.t212_exec_stocks_isa_api_key or "").strip(),
         "exec_api_secret": str(settings.t212_exec_stocks_isa_api_secret or "").strip(),
@@ -90,7 +106,9 @@ class ConfigStore:
         self.db = db
 
     def _get_or_create(self, key: str, default_value: dict[str, Any]) -> AppConfig:
-        record = self.db.execute(select(AppConfig).where(AppConfig.key == key)).scalar_one_or_none()
+        record = self.db.execute(
+            select(AppConfig).where(AppConfig.key == key)
+        ).scalar_one_or_none()
         if record:
             return record
 
@@ -122,7 +140,21 @@ class ConfigStore:
     def get_broker(self) -> dict[str, Any]:
         # Merge with defaults so newly-added keys (e.g. scheduler_enabled) are
         # always present even for broker_config rows saved before they existed.
-        return {**BROKER_DEFAULT, **(self.get("broker_config", BROKER_DEFAULT) or {})}
+        current = {
+            **BROKER_DEFAULT,
+            **(self.get("broker_config", BROKER_DEFAULT) or {}),
+        }
+        # Env-driven keys always reflect the deployment's configured defaults,
+        # overriding any stale value persisted in the DB.
+        changed = False
+        for key in ("broker_mode", "t212_base_env", "autopilot_enabled"):
+            env_val = BROKER_DEFAULT.get(key)
+            if env_val is not None and current.get(key) != env_val:
+                current[key] = env_val
+                changed = True
+        if changed:
+            self.set("broker_config", current)
+        return current
 
     def set_broker(self, value: dict[str, Any]) -> dict[str, Any]:
         merged = {**self.get_broker(), **value}
@@ -186,16 +218,26 @@ class ConfigStore:
             )
             exec_key, exec_secret = self._clean_key_secret(
                 str(entry.get("exec_api_key", merged[kind].get("exec_api_key", ""))),
-                str(entry.get("exec_api_secret", merged[kind].get("exec_api_secret", ""))),
+                str(
+                    entry.get(
+                        "exec_api_secret", merged[kind].get("exec_api_secret", "")
+                    )
+                ),
             )
-            raw_exec_enabled = entry.get("exec_enabled", merged[kind].get("exec_enabled", True))
+            raw_exec_enabled = entry.get(
+                "exec_enabled", merged[kind].get("exec_enabled", True)
+            )
             merged[kind] = {
                 **merged[kind],
                 **normalized,
-                "enabled": bool(entry.get("enabled", merged[kind].get("enabled", True))),
+                "enabled": bool(
+                    entry.get("enabled", merged[kind].get("enabled", True))
+                ),
                 "exec_api_key": exec_key,
                 "exec_api_secret": exec_secret,
-                "exec_enabled": True if raw_exec_enabled is None else bool(raw_exec_enabled),
+                "exec_enabled": True
+                if raw_exec_enabled is None
+                else bool(raw_exec_enabled),
             }
 
         return merged
@@ -216,7 +258,10 @@ class ConfigStore:
                 if str(normalized[kind].get("t212_api_key", "")).strip() != env_key:
                     normalized[kind]["t212_api_key"] = env_key
                     changed = True
-                if str(normalized[kind].get("t212_api_secret", "")).strip() != env_secret:
+                if (
+                    str(normalized[kind].get("t212_api_secret", "")).strip()
+                    != env_secret
+                ):
                     normalized[kind]["t212_api_secret"] = env_secret
                     changed = True
                 if "enabled" not in normalized[kind]:
@@ -227,10 +272,16 @@ class ConfigStore:
             env_exec_key = str(env_entry.get("exec_api_key", "")).strip()
             env_exec_secret = str(env_entry.get("exec_api_secret", "")).strip()
             if env_exec_key and env_exec_secret:
-                if str(normalized[kind].get("exec_api_key", "")).strip() != env_exec_key:
+                if (
+                    str(normalized[kind].get("exec_api_key", "")).strip()
+                    != env_exec_key
+                ):
                     normalized[kind]["exec_api_key"] = env_exec_key
                     changed = True
-                if str(normalized[kind].get("exec_api_secret", "")).strip() != env_exec_secret:
+                if (
+                    str(normalized[kind].get("exec_api_secret", "")).strip()
+                    != env_exec_secret
+                ):
                     normalized[kind]["exec_api_secret"] = env_exec_secret
                     changed = True
 
@@ -242,13 +293,23 @@ class ConfigStore:
         normalized = self._normalize_credentials_map(value)
         return self.set("credentials", normalized)
 
-    def set_account_credentials(self, account_kind: AccountKind, value: dict[str, Any]) -> dict[str, Any]:
+    def set_account_credentials(
+        self, account_kind: AccountKind, value: dict[str, Any]
+    ) -> dict[str, Any]:
         all_creds = self.get_credentials()
         entry = all_creds.get(account_kind, {})
         incoming_key = value.get("t212_api_key")
         incoming_secret = value.get("t212_api_secret")
-        key_value = entry.get("t212_api_key", "") if incoming_key in (None, "") else incoming_key
-        secret_value = entry.get("t212_api_secret", "") if incoming_secret in (None, "") else incoming_secret
+        key_value = (
+            entry.get("t212_api_key", "")
+            if incoming_key in (None, "")
+            else incoming_key
+        )
+        secret_value = (
+            entry.get("t212_api_secret", "")
+            if incoming_secret in (None, "")
+            else incoming_secret
+        )
         normalized = self._normalize_credentials_fields(
             str(key_value),
             str(secret_value),
@@ -258,14 +319,28 @@ class ConfigStore:
         # partial update (e.g. toggling exec_enabled) never wipes the stored key.
         incoming_exec_key = value.get("exec_api_key")
         incoming_exec_secret = value.get("exec_api_secret")
-        exec_key_value = entry.get("exec_api_key", "") if incoming_exec_key in (None, "") else incoming_exec_key
-        exec_secret_value = entry.get("exec_api_secret", "") if incoming_exec_secret in (None, "") else incoming_exec_secret
-        exec_key, exec_secret = self._clean_key_secret(str(exec_key_value), str(exec_secret_value))
+        exec_key_value = (
+            entry.get("exec_api_key", "")
+            if incoming_exec_key in (None, "")
+            else incoming_exec_key
+        )
+        exec_secret_value = (
+            entry.get("exec_api_secret", "")
+            if incoming_exec_secret in (None, "")
+            else incoming_exec_secret
+        )
+        exec_key, exec_secret = self._clean_key_secret(
+            str(exec_key_value), str(exec_secret_value)
+        )
 
         # ``exec_enabled`` is None-tolerant: a partial update that omits it (e.g.
         # changing only the read key) must not silently flip the live-exec toggle.
         exec_enabled_in = value.get("exec_enabled")
-        exec_enabled = entry.get("exec_enabled", True) if exec_enabled_in is None else bool(exec_enabled_in)
+        exec_enabled = (
+            entry.get("exec_enabled", True)
+            if exec_enabled_in is None
+            else bool(exec_enabled_in)
+        )
 
         all_creds[account_kind] = {
             **entry,
@@ -279,7 +354,9 @@ class ConfigStore:
 
     def get_account_credentials(self, account_kind: AccountKind) -> dict[str, Any]:
         creds = self.get_credentials()
-        return creds.get(account_kind, {"t212_api_key": "", "t212_api_secret": "", "enabled": False})
+        return creds.get(
+            account_kind, {"t212_api_key": "", "t212_api_secret": "", "enabled": False}
+        )
 
     def get_account_exec_credentials(self, account_kind: AccountKind) -> dict[str, Any]:
         """The execution (write) key for an account, normalised to the same
@@ -299,9 +376,15 @@ class ConfigStore:
             out[kind] = {
                 "account_kind": kind,
                 "enabled": bool(entry.get("enabled", True)),
-                "configured": bool(str(entry.get("t212_api_key", "")).strip() and str(entry.get("t212_api_secret", "")).strip()),
+                "configured": bool(
+                    str(entry.get("t212_api_key", "")).strip()
+                    and str(entry.get("t212_api_secret", "")).strip()
+                ),
                 "exec_enabled": bool(entry.get("exec_enabled", True)),
-                "exec_configured": bool(str(entry.get("exec_api_key", "")).strip() and str(entry.get("exec_api_secret", "")).strip()),
+                "exec_configured": bool(
+                    str(entry.get("exec_api_key", "")).strip()
+                    and str(entry.get("exec_api_secret", "")).strip()
+                ),
             }
         return out
 
@@ -309,7 +392,9 @@ class ConfigStore:
         """Last execution-key test result per account (transient health, not secrets)."""
         return self.get("execution_status", {})
 
-    def set_execution_status(self, account_kind: AccountKind, status: dict[str, Any]) -> dict[str, Any]:
+    def set_execution_status(
+        self, account_kind: AccountKind, status: dict[str, Any]
+    ) -> dict[str, Any]:
         current = dict(self.get_execution_status() or {})
         current[account_kind] = status
         return self.set("execution_status", current)
@@ -319,7 +404,10 @@ class ConfigStore:
         enabled: list[AccountKind] = []
         for kind in ACCOUNT_KINDS:
             entry = creds.get(kind, {})
-            configured = bool(str(entry.get("t212_api_key", "")).strip() and str(entry.get("t212_api_secret", "")).strip())
+            configured = bool(
+                str(entry.get("t212_api_key", "")).strip()
+                and str(entry.get("t212_api_secret", "")).strip()
+            )
             if bool(entry.get("enabled", True)) and configured:
                 enabled.append(kind)
         return enabled
@@ -344,8 +432,12 @@ class ConfigStore:
         merged["chat_id"] = str(merged.get("chat_id", "")).strip()
         merged["enabled"] = bool(merged.get("enabled", False))
         merged["poll_enabled"] = bool(merged.get("poll_enabled", True))
-        merged["notify_general_updates"] = bool(merged.get("notify_general_updates", True))
-        merged["high_conviction_threshold"] = float(merged.get("high_conviction_threshold", 0.68))
+        merged["notify_general_updates"] = bool(
+            merged.get("notify_general_updates", True)
+        )
+        merged["high_conviction_threshold"] = float(
+            merged.get("high_conviction_threshold", 0.68)
+        )
         return self.set("telegram_config", merged)
 
     def telegram_public(self) -> dict[str, Any]:
@@ -354,7 +446,9 @@ class ConfigStore:
             "enabled": bool(cfg.get("enabled")),
             "poll_enabled": bool(cfg.get("poll_enabled", True)),
             "chat_id": str(cfg.get("chat_id", "")),
-            "high_conviction_threshold": float(cfg.get("high_conviction_threshold", 0.68)),
+            "high_conviction_threshold": float(
+                cfg.get("high_conviction_threshold", 0.68)
+            ),
             "notify_general_updates": bool(cfg.get("notify_general_updates", True)),
             "allowed_user_ids": [int(x) for x in cfg.get("allowed_user_ids", [])],
             "bot_token_configured": bool(str(cfg.get("bot_token", "")).strip()),
@@ -367,19 +461,31 @@ class ConfigStore:
         merged["auto_execute_enabled"] = bool(merged.get("auto_execute_enabled", False))
         # Leveraged execution rail: ISA only.
         merged["account_kind"] = "stocks_isa"
-        merged["per_position_notional"] = float(merged.get("per_position_notional", 200.0))
+        merged["per_position_notional"] = float(
+            merged.get("per_position_notional", 200.0)
+        )
         merged["max_total_exposure"] = float(merged.get("max_total_exposure", 600.0))
         merged["max_open_positions"] = int(merged.get("max_open_positions", 3))
         merged["take_profit_pct"] = float(merged.get("take_profit_pct", 0.08))
         merged["stop_loss_pct"] = float(merged.get("stop_loss_pct", 0.05))
-        merged["daily_profit_target_gbp"] = float(merged.get("daily_profit_target_gbp", 0.0))
+        merged["daily_profit_target_gbp"] = float(
+            merged.get("daily_profit_target_gbp", 0.0)
+        )
         merged["daily_loss_limit_gbp"] = float(merged.get("daily_loss_limit_gbp", 0.0))
         merged["max_daily_trades"] = int(merged.get("max_daily_trades", 0))
-        merged["close_time_uk"] = str(merged.get("close_time_uk", "15:30")).strip() or "15:30"
+        merged["close_time_uk"] = (
+            str(merged.get("close_time_uk", "15:30")).strip() or "15:30"
+        )
         merged["allow_overnight"] = bool(merged.get("allow_overnight", False))
-        merged["scan_symbols"] = [str(x).strip().upper() for x in merged.get("scan_symbols", []) if str(x).strip()]
+        merged["scan_symbols"] = [
+            str(x).strip().upper()
+            for x in merged.get("scan_symbols", [])
+            if str(x).strip()
+        ]
         merged["instrument_priority"] = [
-            str(x).strip().upper() for x in merged.get("instrument_priority", []) if str(x).strip()
+            str(x).strip().upper()
+            for x in merged.get("instrument_priority", [])
+            if str(x).strip()
         ]
         return merged
 
@@ -389,28 +495,49 @@ class ConfigStore:
         # Re-read through normalizer for clamps / symbol cleanup.
         normalized = {**LEVERAGED_DEFAULT, **(stored or {})}
         normalized["enabled"] = bool(normalized.get("enabled", True))
-        normalized["auto_execute_enabled"] = bool(normalized.get("auto_execute_enabled", False))
+        normalized["auto_execute_enabled"] = bool(
+            normalized.get("auto_execute_enabled", False)
+        )
         normalized["account_kind"] = "stocks_isa"
-        normalized["per_position_notional"] = float(normalized.get("per_position_notional", 200.0))
-        normalized["max_total_exposure"] = float(normalized.get("max_total_exposure", 600.0))
+        normalized["per_position_notional"] = float(
+            normalized.get("per_position_notional", 200.0)
+        )
+        normalized["max_total_exposure"] = float(
+            normalized.get("max_total_exposure", 600.0)
+        )
         normalized["max_open_positions"] = int(normalized.get("max_open_positions", 3))
         normalized["take_profit_pct"] = float(normalized.get("take_profit_pct", 0.08))
         normalized["stop_loss_pct"] = float(normalized.get("stop_loss_pct", 0.05))
-        normalized["daily_profit_target_gbp"] = float(normalized.get("daily_profit_target_gbp", 0.0))
-        normalized["daily_loss_limit_gbp"] = float(normalized.get("daily_loss_limit_gbp", 0.0))
+        normalized["daily_profit_target_gbp"] = float(
+            normalized.get("daily_profit_target_gbp", 0.0)
+        )
+        normalized["daily_loss_limit_gbp"] = float(
+            normalized.get("daily_loss_limit_gbp", 0.0)
+        )
         normalized["max_daily_trades"] = int(normalized.get("max_daily_trades", 0))
-        normalized["close_time_uk"] = str(normalized.get("close_time_uk", "15:30")).strip() or "15:30"
+        normalized["close_time_uk"] = (
+            str(normalized.get("close_time_uk", "15:30")).strip() or "15:30"
+        )
         normalized["allow_overnight"] = bool(normalized.get("allow_overnight", False))
-        normalized["scan_symbols"] = [str(x).strip().upper() for x in normalized.get("scan_symbols", []) if str(x).strip()]
+        normalized["scan_symbols"] = [
+            str(x).strip().upper()
+            for x in normalized.get("scan_symbols", [])
+            if str(x).strip()
+        ]
         normalized["instrument_priority"] = [
-            str(x).strip().upper() for x in normalized.get("instrument_priority", []) if str(x).strip()
+            str(x).strip().upper()
+            for x in normalized.get("instrument_priority", [])
+            if str(x).strip()
         ]
         return self.set("leveraged_config", normalized)
 
     def get_rebalance(self) -> dict[str, Any]:
         from app.services.portfolio_optimizer import REBALANCE_DEFAULT
 
-        return {**REBALANCE_DEFAULT, **(self.get("rebalance_config", REBALANCE_DEFAULT) or {})}
+        return {
+            **REBALANCE_DEFAULT,
+            **(self.get("rebalance_config", REBALANCE_DEFAULT) or {}),
+        }
 
     def set_rebalance(self, value: dict[str, Any]) -> dict[str, Any]:
         merged = {**self.get_rebalance(), **value}

@@ -35,7 +35,9 @@ from app.services.leveraged_registry import classify_leveraged
 # Logging (file-based — stdout is reserved for MCP protocol)
 # ──────────────────────────────────────────────
 
-_LOG_DIR = Path(os.environ.get("MCP_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs"))
+_LOG_DIR = Path(
+    os.environ.get("MCP_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs")
+)
 try:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
 except OSError:
@@ -268,7 +270,9 @@ async def _request(
             f"T212 API error {response.status_code} on {method} {path}: {body}"
         )
 
-    raise last_error or RuntimeError(f"T212 request failed after {_MAX_RETRIES + 1} attempts")
+    raise last_error or RuntimeError(
+        f"T212 request failed after {_MAX_RETRIES + 1} attempts"
+    )
 
 
 def _fmt(data: Any) -> str:
@@ -280,9 +284,7 @@ def _validate_account(account: str) -> AccountKind:
     normalised = account.strip().lower().replace(" ", "_").replace("-", "_")
     if normalised in ("invest", "stocks_isa"):
         return normalised  # type: ignore[return-value]
-    raise ValueError(
-        f"Invalid account '{account}'. Must be 'invest' or 'stocks_isa'."
-    )
+    raise ValueError(f"Invalid account '{account}'. Must be 'invest' or 'stocks_isa'.")
 
 
 # ──────────────────────────────────────────────
@@ -304,7 +306,9 @@ async def _get_instrument_map(account: AccountKind) -> dict[str, dict]:
     cached = _instrument_cache.get(account)
     if cached and (time.time() - cached[0]) < _INSTRUMENT_CACHE_TTL:
         return cached[1]
-    data = await _request("GET", "/equity/metadata/instruments", account, rate_group="instruments")
+    data = await _request(
+        "GET", "/equity/metadata/instruments", account, rate_group="instruments"
+    )
     mapping: dict[str, dict] = {}
     if isinstance(data, list):
         for inst in data:
@@ -368,7 +372,9 @@ async def get_positions(account: str = "invest") -> str:
             # T212's newer shape nests {instrument: {ticker, name, currency}};
             # older shape is flat. Surface ticker + name from either, and fill
             # type/short_name from the metadata cache.
-            inst = pos.get("instrument") if isinstance(pos.get("instrument"), dict) else {}
+            inst = (
+                pos.get("instrument") if isinstance(pos.get("instrument"), dict) else {}
+            )
             code = str(pos.get("ticker") or inst.get("ticker") or "").strip()
             meta = imap.get(code, {})
             name = inst.get("name") or meta.get("name")
@@ -378,7 +384,9 @@ async def get_positions(account: str = "invest") -> str:
                 pos["name"] = name
                 lev = classify_leveraged(name)
                 if lev:
-                    pos["leverage"] = lev  # {factor, direction, underlying_name, underlying_ticker}
+                    pos["leverage"] = (
+                        lev  # {factor, direction, underlying_name, underlying_ticker}
+                    )
             if meta.get("type"):
                 pos["instrument_type"] = meta.get("type")
             if meta.get("shortName"):
@@ -728,9 +736,7 @@ async def get_csv_export_status(account: str = "invest") -> str:
         account: 'invest' or 'stocks_isa'
     """
     acct = _validate_account(account)
-    data = await _request(
-        "GET", "/equity/history/exports", acct, rate_group="exports"
-    )
+    data = await _request("GET", "/equity/history/exports", acct, rate_group="exports")
     return _fmt(data)
 
 

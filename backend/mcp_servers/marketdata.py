@@ -23,7 +23,9 @@ from app.services.leveraged_market import (
 )
 
 # ── Logging (file-based — stdout is reserved for MCP protocol) ──
-_LOG_DIR = Path(os.environ.get("MCP_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs"))
+_LOG_DIR = Path(
+    os.environ.get("MCP_LOG_DIR") or (Path(__file__).resolve().parent.parent / "logs")
+)
 try:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
 except OSError:
@@ -69,7 +71,9 @@ def get_price_snapshot(ticker: str) -> str:
 
 
 @mcp.tool()
-def get_price_history_rows(ticker: str, period: str = "3mo", interval: str = "1d") -> str:
+def get_price_history_rows(
+    ticker: str, period: str = "3mo", interval: str = "1d"
+) -> str:
     """Get OHLCV history for a ticker.
 
     Args:
@@ -77,11 +81,24 @@ def get_price_history_rows(ticker: str, period: str = "3mo", interval: str = "1d
         period: 1d, 5d, 1mo, 3mo, 6mo, 1y, 2y, 5y
         interval: 1m, 5m, 15m, 1h, 1d, 1wk
     """
-    logger.info("get_price_history_rows ticker=%s period=%s interval=%s", ticker, period, interval)
+    logger.info(
+        "get_price_history_rows ticker=%s period=%s interval=%s",
+        ticker,
+        period,
+        interval,
+    )
     try:
         rows = get_price_history(ticker, period=period, interval=interval)
     except LeveragedMarketError as exc:
-        return _fmt({"ok": False, "error": str(exc), "ticker": ticker, "period": period, "interval": interval})
+        return _fmt(
+            {
+                "ok": False,
+                "error": str(exc),
+                "ticker": ticker,
+                "period": period,
+                "interval": interval,
+            }
+        )
 
     return _fmt(
         {
@@ -108,7 +125,9 @@ def get_technical_snapshot(ticker: str, period: str = "6mo") -> str:
     try:
         data = get_technicals(ticker, period=period)
     except LeveragedMarketError as exc:
-        return _fmt({"ok": False, "error": str(exc), "ticker": ticker, "period": period})
+        return _fmt(
+            {"ok": False, "error": str(exc), "ticker": ticker, "period": period}
+        )
 
     return _fmt({"ok": True, **data})
 
@@ -153,27 +172,40 @@ def get_risk_metrics(ticker: str, period: str = "1y") -> str:
     try:
         closes = _close_series(ticker, period)
     except LeveragedMarketError as exc:
-        return _fmt({"ok": False, "error": str(exc), "ticker": ticker, "period": period})
+        return _fmt(
+            {"ok": False, "error": str(exc), "ticker": ticker, "period": period}
+        )
     if len(closes) < 5:
-        return _fmt({"ok": False, "error": "insufficient history", "ticker": ticker, "period": period})
+        return _fmt(
+            {
+                "ok": False,
+                "error": "insufficient history",
+                "ticker": ticker,
+                "period": period,
+            }
+        )
 
     rets = closes.pct_change().dropna()
-    total_return = float(closes.iloc[-1] / closes.iloc[0] - 1.0) if float(closes.iloc[0]) else 0.0
-    return _fmt({
-        "ok": True,
-        "ticker": ticker.upper().strip(),
-        "yfinance_ticker": to_yfinance_ticker(ticker),
-        "period": period,
-        "observations": int(len(rets)),
-        "last_close": round(float(closes.iloc[-1]), 4),
-        "total_return": round(total_return, 4),
-        "annualized_return": round(_annualized_return(closes, len(rets)), 4),
-        "annualized_volatility": round(qrisk.annualized_volatility(rets), 4),
-        "max_drawdown": round(qrisk.max_drawdown(closes), 4),
-        "sharpe_ratio": round(qrisk.sharpe_ratio(rets), 3),
-        "sortino_ratio": round(qrisk.sortino_ratio(rets), 3),
-        "value_at_risk_95_daily": round(qrisk.value_at_risk(rets, 0.95), 4),
-    })
+    total_return = (
+        float(closes.iloc[-1] / closes.iloc[0] - 1.0) if float(closes.iloc[0]) else 0.0
+    )
+    return _fmt(
+        {
+            "ok": True,
+            "ticker": ticker.upper().strip(),
+            "yfinance_ticker": to_yfinance_ticker(ticker),
+            "period": period,
+            "observations": int(len(rets)),
+            "last_close": round(float(closes.iloc[-1]), 4),
+            "total_return": round(total_return, 4),
+            "annualized_return": round(_annualized_return(closes, len(rets)), 4),
+            "annualized_volatility": round(qrisk.annualized_volatility(rets), 4),
+            "max_drawdown": round(qrisk.max_drawdown(closes), 4),
+            "sharpe_ratio": round(qrisk.sharpe_ratio(rets), 3),
+            "sortino_ratio": round(qrisk.sortino_ratio(rets), 3),
+            "value_at_risk_95_daily": round(qrisk.value_at_risk(rets, 0.95), 4),
+        }
+    )
 
 
 @mcp.tool()
@@ -187,7 +219,9 @@ def get_correlation_matrix(tickers: str, period: str = "6mo") -> str:
     logger.info("get_correlation_matrix tickers=%s period=%s", tickers, period)
     syms = [t.strip() for t in tickers.split(",") if t.strip()]
     if len(syms) < 2:
-        return _fmt({"ok": False, "error": "provide at least 2 tickers", "tickers": syms})
+        return _fmt(
+            {"ok": False, "error": "provide at least 2 tickers", "tickers": syms}
+        )
 
     series: dict[str, pd.Series] = {}
     errors: dict[str, str] = {}
@@ -197,9 +231,17 @@ def get_correlation_matrix(tickers: str, period: str = "6mo") -> str:
         except LeveragedMarketError as exc:
             errors[sym] = str(exc)
     if len(series) < 2:
-        return _fmt({"ok": False, "error": "insufficient data for correlation", "errors": errors})
+        return _fmt(
+            {
+                "ok": False,
+                "error": "insufficient data for correlation",
+                "errors": errors,
+            }
+        )
 
-    return _fmt({"ok": True, "period": period, **corr_matrix(series), "errors": errors or None})
+    return _fmt(
+        {"ok": True, "period": period, **corr_matrix(series), "errors": errors or None}
+    )
 
 
 @mcp.tool()
@@ -226,31 +268,41 @@ def compare_assets(tickers: str, period: str = "6mo") -> str:
             assets.append({"ticker": sym.upper(), "ok": False, "error": str(exc)})
             continue
         if len(closes) < 5:
-            assets.append({"ticker": sym.upper(), "ok": False, "error": "insufficient history"})
+            assets.append(
+                {"ticker": sym.upper(), "ok": False, "error": "insufficient history"}
+            )
             continue
 
         rets = closes.pct_change().dropna()
         last = float(closes.iloc[-1])
 
         def momentum(n: int) -> float | None:
-            return float(last / closes.iloc[-n] - 1.0) if len(closes) > n and float(closes.iloc[-n]) else None
+            return (
+                float(last / closes.iloc[-n] - 1.0)
+                if len(closes) > n and float(closes.iloc[-n])
+                else None
+            )
 
         rsi_series = rsi(closes).dropna()
         latest_rsi = float(rsi_series.iloc[-1]) if not rsi_series.empty else None
         mom_1m = momentum(21)
         mom_3m = momentum(63)
-        assets.append({
-            "ticker": sym.upper(),
-            "ok": True,
-            "last_close": round(last, 4),
-            "total_return": round(float(closes.iloc[-1] / closes.iloc[0] - 1.0), 4) if float(closes.iloc[0]) else None,
-            "annualized_volatility": round(qrisk.annualized_volatility(rets), 4),
-            "sharpe_ratio": round(qrisk.sharpe_ratio(rets), 3),
-            "max_drawdown": round(qrisk.max_drawdown(closes), 4),
-            "momentum_1m": round(mom_1m, 4) if mom_1m is not None else None,
-            "momentum_3m": round(mom_3m, 4) if mom_3m is not None else None,
-            "rsi_14": round(latest_rsi, 1) if latest_rsi is not None else None,
-        })
+        assets.append(
+            {
+                "ticker": sym.upper(),
+                "ok": True,
+                "last_close": round(last, 4),
+                "total_return": round(float(closes.iloc[-1] / closes.iloc[0] - 1.0), 4)
+                if float(closes.iloc[0])
+                else None,
+                "annualized_volatility": round(qrisk.annualized_volatility(rets), 4),
+                "sharpe_ratio": round(qrisk.sharpe_ratio(rets), 3),
+                "max_drawdown": round(qrisk.max_drawdown(closes), 4),
+                "momentum_1m": round(mom_1m, 4) if mom_1m is not None else None,
+                "momentum_3m": round(mom_3m, 4) if mom_3m is not None else None,
+                "rsi_14": round(latest_rsi, 1) if latest_rsi is not None else None,
+            }
+        )
 
     return _fmt({"ok": True, "period": period, "assets": assets})
 
@@ -267,11 +319,15 @@ def get_indicator_series(ticker: str, indicator: str, period: str = "6mo") -> st
         period: Lookback period.
     """
     ind = indicator.strip().lower()
-    logger.info("get_indicator_series ticker=%s indicator=%s period=%s", ticker, ind, period)
+    logger.info(
+        "get_indicator_series ticker=%s indicator=%s period=%s", ticker, ind, period
+    )
     try:
         df = _download_history_frame(ticker, period, "1d")
     except LeveragedMarketError as exc:
-        return _fmt({"ok": False, "error": str(exc), "ticker": ticker, "indicator": ind})
+        return _fmt(
+            {"ok": False, "error": str(exc), "ticker": ticker, "indicator": ind}
+        )
 
     close = df["close"].astype(float).reset_index(drop=True)
     high = df["high"].astype(float).reset_index(drop=True)
@@ -294,19 +350,58 @@ def get_indicator_series(ticker: str, indicator: str, period: str = "6mo") -> st
     }
 
     if ind in single:
-        return _fmt({"ok": True, "ticker": ticker.upper().strip(), "indicator": ind, "period": period,
-                     "series": to_points(single[ind]())})
+        return _fmt(
+            {
+                "ok": True,
+                "ticker": ticker.upper().strip(),
+                "indicator": ind,
+                "period": period,
+                "series": to_points(single[ind]()),
+            }
+        )
     if ind == "macd":
         macd_line, signal_line, hist = macd_fn(close)
-        return _fmt({"ok": True, "ticker": ticker.upper().strip(), "indicator": "macd", "period": period,
-                     "macd": to_points(macd_line), "signal": to_points(signal_line), "histogram": to_points(hist)})
+        return _fmt(
+            {
+                "ok": True,
+                "ticker": ticker.upper().strip(),
+                "indicator": "macd",
+                "period": period,
+                "macd": to_points(macd_line),
+                "signal": to_points(signal_line),
+                "histogram": to_points(hist),
+            }
+        )
     if ind in ("bollinger", "bbands"):
         upper, middle, lower = bollinger_bands(close)
-        return _fmt({"ok": True, "ticker": ticker.upper().strip(), "indicator": "bollinger", "period": period,
-                     "upper": to_points(upper), "middle": to_points(middle), "lower": to_points(lower)})
+        return _fmt(
+            {
+                "ok": True,
+                "ticker": ticker.upper().strip(),
+                "indicator": "bollinger",
+                "period": period,
+                "upper": to_points(upper),
+                "middle": to_points(middle),
+                "lower": to_points(lower),
+            }
+        )
 
-    return _fmt({"ok": False, "error": f"unknown indicator {ind!r}",
-                 "supported": ["sma20", "sma50", "sma200", "ema20", "rsi", "macd", "atr", "bollinger"]})
+    return _fmt(
+        {
+            "ok": False,
+            "error": f"unknown indicator {ind!r}",
+            "supported": [
+                "sma20",
+                "sma50",
+                "sma200",
+                "ema20",
+                "rsi",
+                "macd",
+                "atr",
+                "bollinger",
+            ],
+        }
+    )
 
 
 if __name__ == "__main__":
